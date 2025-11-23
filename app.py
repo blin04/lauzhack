@@ -1,14 +1,15 @@
-from flask import Flask, render_template, request, jsonify, send_file
+from flask import Flask, render_template, request, jsonify
 import os
 import torch
 import numpy as np
 from PIL import Image, ImageDraw
 import matplotlib
-import matplotlib.pyplot as plt
 from io import BytesIO
 import base64
-from transformers import OneFormerProcessor, OneFormerForUniversalSegmentation
-import cv2
+from transformers import Sam3Processor, Sam3Model
+from sklearn.cluster import DBSCAN
+from scipy.spatial import ConvexHull
+from scipy.ndimage import distance_transform_edt
 import traceback
 
 app = Flask(__name__)
@@ -25,87 +26,63 @@ device = None
 def load_model():
     global model, processor, device
     if model is None:
-        print("Loading model...")
+        print("Loading SAM3 model...")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {device}")
-        processor = OneFormerProcessor.from_pretrained("shi-labs/oneformer_coco_swin_large")
-        model = OneFormerForUniversalSegmentation.from_pretrained("shi-labs/oneformer_coco_swin_large")
+        processor = Sam3Processor.from_pretrained("facebook/sam3")
+        model = Sam3Model.from_pretrained("facebook/sam3")
         model = model.to(device)
         model.eval()
         print(f"Model loaded successfully on {device}")
 
-def compute_orientation(mask):
-    """Compute orientation angle and centroid for a binary mask."""
-    try:
-        if torch.is_tensor(mask):
-            mask_np = mask.cpu().numpy()
-        else:
-            mask_np = np.array(mask)
-        
-        if mask_np.dtype == bool:
-            mask_uint8 = mask_np.astype(np.uint8) * 255
-        else:
-            mask_uint8 = (mask_np > 0).astype(np.uint8) * 255
-        
-        coords = np.column_stack(np.where(mask_uint8 > 0))
-        if len(coords) < 5:
-            return None
-        
-        points = coords[:, [1, 0]].astype(np.float32)
-        (cx, cy), (w, h), angle = cv2.fitEllipse(points)
-        
-        major_len = max(w, h) / 2.0
-        minor_len = min(w, h) / 2.0
-        
-        if w > h:
-            angle_deg = angle
-        else:
-            angle_deg = (angle + 90) % 180
-        
-        centroid = np.mean(coords, axis=0)
-        centroid_xy = (float(centroid[1]), float(centroid[0]))
-        return angle_deg, centroid_xy, major_len, minor_len
-    except Exception as e:
-        print(f"Error in compute_orientation: {e}")
+def compute_orientation(mask, threshold=0.5):
+    """
+    Estimate orientation using PCA on mask pixels.
+    Returns (angle_deg, centroid_xy, major_len, minor_len) or None if empty.
+    """
+    if torch.is_tensor(mask):
+        arr = mask.cpu().numpy()
+    else:
+        arr = np.array(mask)
+
+    # normalize to boolean
+    if arr.dtype == np.uint8 or arr.max() > 1:
+        bw = arr > 127
+    else:
+        bw = arr > threshold
+
+    coords = np.column_stack(np.where(bw))  # rows (y), cols (x)
+    if coords.size == 0:
         return None
 
-def minimal_axis_angle_diff(a_deg, b_deg):
-    """Return smallest absolute angle difference between two axial angles."""
-    raw = abs(((a_deg - b_deg + 180) % 360) - 180)
-    if raw > 90:
-        raw = 180 - raw
-    return raw
+    centroid = coords.mean(axis=0)  # (y, x)
+    centered = coords - centroid
+    if centered.shape[0] < 2:
+        return None
 
-def cluster_orientations(orientations, angle_threshold=15.0):
-    """Cluster car orientations based on angle similarity."""
-    if not orientations:
-        return []
-    
-    clusters = []
-    for item in orientations:
-        orient, color = item
-        if orient is None:
-            continue
-        angle_deg, centroid, major_len, minor_len = orient
-        
-        placed = False
-        for cluster in clusters:
-            cluster_angle = cluster['representative_angle']
-            if minimal_axis_angle_diff(angle_deg, cluster_angle) < angle_threshold:
-                cluster['items'].append((orient, color))
-                placed = True
-                break
-        
-        if not placed:
-            clusters.append({
-                'representative_angle': angle_deg,
-                'items': [(orient, color)]
-            })
-    
-    return clusters
+    cov = np.cov(centered, rowvar=False)  # 2x2 cov of [y, x]
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    # largest eigenvalue -> principal axis
+    idx = np.argmax(eigvals)
+    major_vec = eigvecs[:, idx]  # [vy, vx]
+    # convert to (vx, vy) and normalize
+    vx, vy = float(major_vec[1]), float(major_vec[0])
+    norm = np.hypot(vx, vy) or 1.0
+    vx /= norm; vy /= norm
+
+    angle_rad = np.arctan2(vy, vx)
+    angle_deg = np.degrees(angle_rad)
+
+    # approximate axis lengths from eigenvalues
+    major_len = 2.0 * np.sqrt(max(eigvals[idx], 0.0))
+    minor_len = 2.0 * np.sqrt(max(eigvals[1-idx], 0.0))
+
+    # centroid in (x, y)
+    centroid_xy = (float(centroid[1]), float(centroid[0]))
+    return angle_deg, centroid_xy, major_len, minor_len
 
 def overlay_masks(image, masks, draw_orientations=True):
-    """Overlay detected car masks on the image."""
+    """Overlay masks on image with optional orientation lines."""
     image = image.convert("RGBA")
     masks_np = 255 * masks.cpu().numpy().astype(np.uint8)
     
@@ -146,27 +123,6 @@ def overlay_masks(image, masks, draw_orientations=True):
 
     return image, orientations
 
-def derive_instance_masks_from_panoptic(segmentation, segments_info, target_label_id=None):
-    """
-    Convert panoptic segmentation into per-object binary masks.
-    Optionally filter by COCO class ID.
-    """
-    seg_np = segmentation.cpu().numpy()
-    masks = []
-
-    for seg in segments_info:
-        if target_label_id is not None and seg["label_id"] != target_label_id:
-            continue
-        
-        mask = (seg_np == seg["id"])
-        if mask.sum() > 10:  # remove noise
-            masks.append(torch.tensor(mask, dtype=torch.float32))
-    
-    if len(masks) == 0:
-        return torch.empty((0, seg_np.shape[0], seg_np.shape[1]))
-    
-    return torch.stack(masks)
-
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -197,64 +153,35 @@ def analyze():
         image = Image.open(file.stream).convert("RGB")
         print(f"Image loaded: {image.size}")
         
-        # Detect cars
-        width, height = image.size
-        inputs_cars = processor(
-            images=image,
-            text="car body",
-            task_inputs=["panoptic"],
-            return_tensors="pt"
-        )
+        # ===== DETECT CARS ===== #
+        print("\nDetecting cars and estimating their orientations...")
+        inputs_cars = processor(images=image, text="car body", return_tensors="pt").to(device)
 
-        # Step 1: prepare inputs
-        inputs_cars = processor(
-            images=image,
-            text="car body",
-            task_inputs=["panoptic"],
-            return_tensors="pt"
-        ).to(device)
-
-        # Step 2: inference
         with torch.no_grad():
             outputs_cars = model(**inputs_cars)
 
-        # Step 3: required fix — provide original resolution manually
-        height, width = image.size[1], image.size[0]
-        target_sizes = torch.tensor([[height, width]])
-
-        # Step 4: post-processing
-        results = processor.post_process_panoptic_segmentation(
+        results_cars = processor.post_process_instance_segmentation(
             outputs_cars,
-            target_sizes=target_sizes.tolist()
+            threshold=0.5,
+            mask_threshold=0.5,
+            target_sizes=inputs_cars.get("original_sizes").tolist()
         )[0]
 
-        # Extract masks manually (car label_id = 2 in COCO)
-        masks = derive_instance_masks_from_panoptic(
-            results["segmentation"],
-            results["segments_info"],
-            target_label_id=2
-        )
-
-        results["masks"] = masks
-
-
-        print(f"Initially found {len(results['masks'])} car objects. Filtering by aspect ratio and area...")
+        print(f"Initially found {len(results_cars['masks'])} car objects. Filtering by aspect ratio and area...")
         
-        # Filter by aspect ratio and area (EXACT code from notebook)
+        # Filter by aspect ratio and area
         keep_indices = []
         min_aspect_ratio = 1.3
         max_aspect_ratio = 2.8
-        min_area = 800  # Minimum area in pixels to be considered a car
-        max_area = 2000  # Maximum area in pixels to exclude trucks
+        min_area = 800
+        max_area = 2000
         
-        for i, mask in enumerate(results["masks"]):
-            # Calculate area
+        for i, mask in enumerate(results_cars["masks"]):
             if torch.is_tensor(mask):
                 mask_np = mask.cpu().numpy()
             else:
                 mask_np = np.array(mask)
             
-            # Check if mask is boolean or 0-1 or 0-255
             if mask_np.dtype == bool:
                 area = np.sum(mask_np)
             else:
@@ -267,7 +194,7 @@ def analyze():
             if orient is None:
                 continue
             _, _, major_len, minor_len = orient
-            if minor_len < 1.0:  # Avoid division by zero
+            if minor_len < 1.0:
                 continue
             
             aspect_ratio = major_len / minor_len
@@ -275,50 +202,215 @@ def analyze():
                 keep_indices.append(i)
         
         # Apply filter
-        filtered_masks = results["masks"][keep_indices]
+        results_cars["masks"] = results_cars["masks"][keep_indices]
+        results_cars["scores"] = results_cars["scores"][keep_indices]
+        if "labels" in results_cars:
+            results_cars["labels"] = results_cars["labels"][keep_indices]
         
-        print(f"Found {len(filtered_masks)} car objects after filtering")
+        print(f"Found {len(results_cars['masks'])} car objects after filtering")
         
-        if len(filtered_masks) == 0:
+        # Get car orientations
+        cars_image, car_orientations = overlay_masks(image, results_cars["masks"], draw_orientations=False)
+        
+        # ===== DETECT ROADS ===== #
+        print("\nDetecting roads...")
+        inputs_roads = processor(images=image, text="street road", return_tensors="pt").to(device)
+
+        with torch.no_grad():
+            outputs_roads = model(**inputs_roads)
+
+        results_roads = processor.post_process_instance_segmentation(
+            outputs_roads,
+            threshold=0.5,
+            mask_threshold=0.5,
+            target_sizes=inputs_roads.get("original_sizes").tolist()
+        )[0]
+
+        print(f"Found {len(results_roads['masks'])} road objects")
+        
+        road_masks = results_roads["masks"]
+        if torch.is_tensor(road_masks):
+            road_masks_np = road_masks.cpu().numpy().astype(bool)
+        else:
+            road_masks_np = np.array(road_masks).astype(bool)
+        
+        # ===== FILTER CARS ON ROADS ===== #
+        print("\n=== Filtering out cars that are on roads ===")
+        
+        car_masks = results_cars["masks"]
+        on_road_flags = []
+        
+        if road_masks_np.size == 0:
+            union_road = None
+            dist_map = None
+            print("No road masks available, skipping road-based filtering.")
+            on_road_flags = [False] * len(car_masks)
+        else:
+            union_road = road_masks_np.any(axis=0)
+            dist_map = distance_transform_edt(~union_road)
+            
+            road_dist_thresh = 40.0
+            
+            for i, mask in enumerate(car_masks):
+                if torch.is_tensor(mask):
+                    car_mask_np = mask.cpu().numpy()
+                else:
+                    car_mask_np = np.array(mask)
+                
+                if car_mask_np.dtype == bool:
+                    car_bin = car_mask_np
+                else:
+                    car_bin = car_mask_np > 0
+                
+                car_area = car_bin.sum()
+                if car_area == 0:
+                    on_road_flags.append(False)
+                    continue
+                
+                ys, xs = np.where(car_bin)
+                cy = int(round(ys.mean()))
+                cx = int(round(xs.mean()))
+                
+                h, w = dist_map.shape
+                cy = max(0, min(h - 1, cy))
+                cx = max(0, min(w - 1, cx))
+                
+                dist_to_road = dist_map[cy, cx]
+                on_road = dist_to_road <= road_dist_thresh
+                on_road_flags.append(on_road)
+        
+        n_on_road = sum(on_road_flags)
+        print(f"Cars near roads (filtered out): {n_on_road}")
+        print(f"Cars off roads (kept for clustering): {len(on_road_flags) - n_on_road}")
+        
+        # ===== CLUSTER OFF-ROAD CARS ===== #
+        print("\n=== Clustering OFF-ROAD cars into groups ===")
+        
+        offroad_centroids = []
+        offroad_indices = []
+        
+        for i, (orient, _) in enumerate(car_orientations):
+            if on_road_flags[i]:
+                continue
+            
+            if orient is not None:
+                _, centroid, _, _ = orient
+                offroad_centroids.append(centroid)
+                offroad_indices.append(i)
+            else:
+                mask = results_cars["masks"][i]
+                if torch.is_tensor(mask):
+                    mask_np = mask.cpu().numpy()
+                else:
+                    mask_np = np.array(mask)
+                ys, xs = np.where(mask_np > 0)
+                if len(xs) == 0:
+                    continue
+                offroad_centroids.append((float(xs.mean()), float(ys.mean())))
+                offroad_indices.append(i)
+        
+        if len(offroad_centroids) == 0:
+            print("No off-road cars to cluster.")
             return jsonify({
                 'success': True,
-                'total_cars': 0,
+                'total_cars': int(len(car_masks)),
+                'offroad_cars': 0,
                 'num_clusters': 0,
                 'detection_image': '',
                 'cluster_image': '',
                 'cluster_details': [],
-                'message': 'No cars detected. Try a different image or adjust detection parameters.'
+                'message': 'No parked cars detected (all cars are on roads).'
             })
         
-        # Overlay masks and get orientations
-        result_image, orientations = overlay_masks(image, filtered_masks, draw_orientations=True)
+        offroad_centroids = np.array(offroad_centroids)
         
-        # Cluster orientations
-        clusters = cluster_orientations(orientations, angle_threshold=15.0)
+        # DBSCAN clustering
+        eps = 150
+        min_samples = 1
+        clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(offroad_centroids)
+        labels = clustering.labels_
         
-        # Create cluster visualization
-        clustered_image = image.convert("RGBA")
-        cluster_colors = [
+        unique_labels = sorted(set(labels))
+        print(f"Total off-road cars: {len(offroad_centroids)}")
+        print(f"Number of clusters: {len(unique_labels)}")
+        
+        # ===== VISUALIZATION ===== #
+        # Show roads in background
+        clustered_image = image.copy().convert("RGBA")
+        roads_vis, _ = overlay_masks(image.copy(), results_roads["masks"], draw_orientations=False)
+        clustered_image = roads_vis.convert("RGBA")
+        
+        # Create transparent overlay for convex hulls
+        overlay = Image.new('RGBA', clustered_image.size, (0, 0, 0, 0))
+        overlay_draw = ImageDraw.Draw(overlay)
+        
+        base_colors = [
             (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
-            (255, 0, 255), (0, 255, 255), (128, 0, 128), (255, 128, 0)
+            (255, 0, 255), (0, 255, 255), (255, 128, 0), (128, 0, 255),
+            (0, 128, 255), (128, 255, 0)
         ]
         
+        cluster_details = []
+        
+        for lbl in unique_labels:
+            idxs = np.where(labels == lbl)[0]
+            if len(idxs) == 0:
+                continue
+            
+            color = base_colors[lbl % len(base_colors)] if lbl != -1 else (200, 200, 200)
+            cluster_points = offroad_centroids[idxs]
+            
+            # Calculate average angle for this cluster
+            cluster_angles = []
+            for idx in idxs:
+                original_idx = offroad_indices[idx]
+                orient, _ = car_orientations[original_idx]
+                if orient is not None:
+                    angle_deg, _, _, _ = orient
+                    cluster_angles.append(angle_deg)
+            
+            avg_angle = float(np.mean(cluster_angles)) if cluster_angles else 0.0
+            
+            # Draw convex hull
+            if len(cluster_points) >= 3:
+                hull = ConvexHull(cluster_points)
+                hull_points = cluster_points[hull.vertices]
+                polygon = [tuple(point) for point in hull_points]
+                overlay_draw.polygon(polygon, fill=color + (50,), outline=color + (255,), width=3)
+            elif len(cluster_points) == 2:
+                p1, p2 = cluster_points
+                padding = 20
+                overlay_draw.line([tuple(p1), tuple(p2)], fill=color + (255,), width=3)
+                for p in cluster_points:
+                    overlay_draw.ellipse([p[0]-padding, p[1]-padding, p[0]+padding, p[1]+padding],
+                                        outline=color + (255,), width=3)
+            else:
+                p = cluster_points[0]
+                padding = 30
+                overlay_draw.ellipse([p[0]-padding, p[1]-padding, p[0]+padding, p[1]+padding],
+                                    fill=color + (50,), outline=color + (255,), width=3)
+            
+            cluster_details.append({
+                'cluster_id': int(lbl) if lbl >= 0 else -1,
+                'count': int(len(idxs)),
+                'angle': avg_angle,
+                'centroid': [float(x) for x in cluster_points.mean(axis=0)]
+            })
+        
+        # Composite overlay
+        clustered_image = Image.alpha_composite(clustered_image, overlay)
         draw = ImageDraw.Draw(clustered_image)
-        for cluster_idx, cluster in enumerate(clusters):
-            cluster_color = cluster_colors[cluster_idx % len(cluster_colors)]
-            for orient, _ in cluster['items']:
-                if orient is None:
-                    continue
-                angle_deg, (cx, cy), major_len, minor_len = orient
-                L = max(20, major_len * 4)
-                ang = np.radians(angle_deg)
-                dx = np.cos(ang) * L
-                dy = np.sin(ang) * L
-                start = (cx - dx, cy - dy)
-                end = (cx + dx, cy + dy)
-                draw.line([start, end], fill=cluster_color + (255,), width=4)
-                r = 5
-                draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=cluster_color + (255,))
+        
+        # Draw cluster labels
+        for lbl in unique_labels:
+            idxs = np.where(labels == lbl)[0]
+            if len(idxs) == 0:
+                continue
+            cluster_center = offroad_centroids[idxs].mean(axis=0)
+            label_text = f"C{lbl if lbl >= 0 else 'N'} ({len(idxs)})"
+            draw.text((cluster_center[0], cluster_center[1]),
+                     label_text,
+                     fill=(255, 255, 255, 255))
         
         # Convert images to base64
         def pil_to_base64(img):
@@ -326,19 +418,17 @@ def analyze():
             img.convert("RGB").save(buffered, format="PNG")
             return base64.b64encode(buffered.getvalue()).decode()
         
-        print(f"Analysis complete: {len(filtered_masks)} cars, {len(clusters)} clusters")
+        print(f"Analysis complete: {len(offroad_centroids)} parked cars, {len(unique_labels)} clusters")
         
         return jsonify({
             'success': True,
-            'total_cars': len(filtered_masks),
-            'num_clusters': len(clusters),
-            'detection_image': pil_to_base64(result_image),
+            'total_cars': int(len(car_masks)),
+            'offroad_cars': int(len(offroad_centroids)),
+            'onroad_cars': int(n_on_road),
+            'num_clusters': int(len(unique_labels)),
+            'detection_image': pil_to_base64(cars_image),
             'cluster_image': pil_to_base64(clustered_image),
-            'cluster_details': [{
-                'cluster_id': idx,
-                'angle': cluster['representative_angle'],
-                'count': len(cluster['items'])
-            } for idx, cluster in enumerate(clusters)]
+            'cluster_details': cluster_details
         })
         
     except Exception as e:
