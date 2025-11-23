@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>sPARKing :: Parking Intelligence System</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Roboto+Mono:wght@300;400;700&display=swap');
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Roboto Mono', monospace;
+            background: linear-gradient(135deg, #0a0e27 0%, #1a1f3a 100%);
+            color: #00ff88;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+        
+        .grid-bg {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-image: 
+                linear-gradient(rgba(0, 255, 136, 0.03) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(0, 255, 136, 0.03) 1px, transparent 1px);
+            background-size: 50px 50px;
+            z-index: 0;
+            pointer-events: none;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+            position: relative;
+            z-index: 1;
+        }
+        
+        header {
+            text-align: center;
+            padding: 40px 20px;
+            position: relative;
+        }
+        
+        .logo {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 3.5em;
+            font-weight: 900;
+            background: linear-gradient(45deg, #00ff88, #00d4ff, #ff00de);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            text-shadow: 0 0 30px rgba(0, 255, 136, 0.5);
+            letter-spacing: 8px;
+            animation: glow 2s ease-in-out infinite alternate;
+        }
+        
+        @keyframes glow {
+            from { filter: drop-shadow(0 0 10px rgba(0, 255, 136, 0.5)); }
+            to { filter: drop-shadow(0 0 20px rgba(0, 255, 136, 0.8)); }
+        }
+        
+        .subtitle {
+            font-size: 0.9em;
+            color: #00d4ff;
+            margin-top: 10px;
+            letter-spacing: 4px;
+            text-transform: uppercase;
+        }
+        
+        .status-bar {
+            display: flex;
+            justify-content: center;
+            gap: 30px;
+            margin: 30px 0;
+            flex-wrap: wrap;
+        }
+        
+        .status-item {
+            background: rgba(0, 20, 40, 0.6);
+            border: 1px solid #00ff88;
+            padding: 15px 25px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            box-shadow: 0 0 20px rgba(0, 255, 136, 0.2);
+            transition: all 0.3s;
+        }
+        
+        .status-item:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 5px 30px rgba(0, 255, 136, 0.4);
+        }
+        
+        .status-icon {
+            font-size: 24px;
+        }
+        
+        .upload-zone {
+            background: rgba(0, 20, 40, 0.7);
+            border: 3px dashed #00ff88;
+            border-radius: 15px;
+            padding: 60px 40px;
+            text-align: center;
+            margin: 40px 0;
+            transition: all 0.3s;
+            cursor: pointer;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .upload-zone::before {
+            content: '';
+            position: absolute;
+            top: -2px;
+            left: -2px;
+            right: -2px;
+            bottom: -2px;
+            background: linear-gradient(45deg, #00ff88, #00d4ff, #ff00de, #00ff88);
+            background-size: 300% 300%;
+            border-radius: 15px;
+            z-index: -1;
+            opacity: 0;
+            transition: opacity 0.3s;
+            animation: gradientFlow 3s ease infinite;
+        }
+        
+        @keyframes gradientFlow {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+        
+        .upload-zone:hover::before {
+            opacity: 0.3;
+        }
+        
+        .upload-zone:hover {
+            border-color: #00d4ff;
+            transform: scale(1.02);
+        }
+        
+        .upload-zone.drag-over {
+            background: rgba(0, 255, 136, 0.1);
+            border-color: #00d4ff;
+        }
+        
+        .upload-icon {
+            font-size: 80px;
+            margin-bottom: 20px;
+            animation: float 3s ease-in-out infinite;
+        }
+        
+        @keyframes float {
+            0%, 100% { transform: translateY(0px); }
+            50% { transform: translateY(-10px); }
+        }
+        
+        .upload-text {
+            font-size: 1.2em;
+            color: #00ff88;
+            margin-bottom: 10px;
+        }
+        
+        .upload-hint {
+            color: #888;
+            font-size: 0.9em;
+        }
+        
+        #fileInput {
+            display: none;
+        }
+        
+        .btn {
+            background: linear-gradient(45deg, #00ff88, #00d4ff);
+            color: #0a0e27;
+            border: none;
+            padding: 15px 40px;
+            font-size: 1.1em;
+            font-weight: 700;
+            border-radius: 8px;
+            cursor: pointer;
+            font-family: 'Orbitron', sans-serif;
+            letter-spacing: 2px;
+            transition: all 0.3s;
+            box-shadow: 0 5px 20px rgba(0, 255, 136, 0.3);
+            text-transform: uppercase;
+        }
+        
+        .btn:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 8px 30px rgba(0, 255, 136, 0.5);
+        }
+        
+        .btn:disabled {
+            background: #333;
+            color: #666;
+            cursor: not-allowed;
+            box-shadow: none;
+        }
+        
+        .results-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+            gap: 30px;
+            margin: 40px 0;
+        }
+        
+        .result-card {
+            background: rgba(0, 20, 40, 0.8);
+            border: 1px solid #00ff88;
+            border-radius: 12px;
+            padding: 25px;
+            box-shadow: 0 5px 30px rgba(0, 255, 136, 0.2);
+        }
+        
+        .result-card h3 {
+            color: #00d4ff;
+            font-family: 'Orbitron', sans-serif;
+            margin-bottom: 20px;
+            font-size: 1.3em;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .result-image {
+            width: 100%;
+            border-radius: 8px;
+            border: 2px solid #00ff88;
+            margin: 15px 0;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+        
+        .stat-box {
+            background: rgba(0, 255, 136, 0.1);
+            border: 1px solid #00ff88;
+            border-radius: 8px;
+            padding: 15px;
+            text-align: center;
+        }
+        
+        .stat-value {
+            font-size: 2em;
+            font-weight: 700;
+            color: #00ff88;
+            font-family: 'Orbitron', sans-serif;
+        }
+        
+        .stat-label {
+            font-size: 0.8em;
+            color: #888;
+            margin-top: 5px;
+            text-transform: uppercase;
+        }
+        
+        .cluster-list {
+            margin-top: 15px;
+        }
+        
+        .cluster-item {
+            background: rgba(0, 255, 136, 0.05);
+            border-left: 4px solid #00ff88;
+            padding: 12px 15px;
+            margin: 10px 0;
+            border-radius: 4px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            display: none;
+        }
+        
+        .loading.active {
+            display: block;
+        }
+        
+        .spinner {
+            border: 4px solid rgba(0, 255, 136, 0.1);
+            border-top: 4px solid #00ff88;
+            border-radius: 50%;
+            width: 60px;
+            height: 60px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .error {
+            background: rgba(255, 0, 100, 0.1);
+            border: 1px solid #ff0064;
+            color: #ff0064;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 20px 0;
+            display: none;
+        }
+        
+        .error.active {
+            display: block;
+        }
+        
+        #results {
+            display: none;
+        }
+        
+        #results.active {
+            display: block;
+        }
+        
+        .preview-container {
+            margin: 30px 0;
+            text-align: center;
+        }
+        
+        .preview-image {
+            max-width: 100%;
+            max-height: 400px;
+            border-radius: 12px;
+            border: 2px solid #00ff88;
+            box-shadow: 0 5px 30px rgba(0, 255, 136, 0.3);
+        }
+        
+        footer {
+            text-align: center;
+            padding: 40px 20px;
+            color: #666;
+            font-size: 0.9em;
+            margin-top: 60px;
+        }
+    </style>
+</head>
+<body>
+    <div class="grid-bg"></div>
+    
+    <div class="container">
+        <header>
+            <div class="logo">sPARKing</div>
+            <div class="subtitle">⚡ Parking Intelligence System ⚡</div>
+        </header>
+        
+        <div class="upload-zone" id="uploadZone">
+            <div class="upload-icon">📍</div>
+            <div class="upload-text">Drop parking lot image or click to upload</div>
+            <div class="upload-hint">Supports: PNG, JPG, JPEG (Max 16MB)</div>
+            <input type="file" id="fileInput" accept="image/*">
+        </div>
+        
+        <div class="preview-container" id="previewContainer" style="display: none;">
+            <img id="previewImage" class="preview-image" alt="Preview">
+            <div style="margin-top: 20px;">
+                <button class="btn" id="analyzeBtn">🔍 Analyze Parking</button>
+            </div>
+        </div>
+        
+        <div class="loading" id="loading">
+            <div class="spinner"></div>
+            <div style="color: #00ff88; font-size: 1.2em;">Analyzing parking lot...</div>
+            <div style="color: #888; margin-top: 10px;">Detecting vehicles & computing orientations</div>
+        </div>
+        
+        <div class="error" id="error"></div>
+        
+        <div id="results">
+            <h2 style="text-align: center; font-family: 'Orbitron', sans-serif; color: #00d4ff; margin: 40px 0; font-size: 2em;">
+                📊 Analysis Results
+            </h2>
+            
+            <div class="stats-grid">
+                <div class="stat-box">
+                    <div class="stat-value" id="totalCars">0</div>
+                    <div class="stat-label">Vehicles Detected</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="numClusters">0</div>
+                    <div class="stat-label">Parking Patterns</div>
+                </div>
+            </div>
+            
+            <div class="results-grid">
+                <div class="result-card">
+                    <h3>🎯 Detection Overview</h3>
+                    <img id="detectionImage" class="result-image" alt="Detection">
+                    <div style="color: #888; font-size: 0.9em; margin-top: 10px;">
+                        Individual vehicle detection with orientation vectors
+                    </div>
+                </div>
+                
+                <div class="result-card">
+                    <h3>🧩 Clustering Analysis</h3>
+                    <img id="clusterImage" class="result-image" alt="Clusters">
+                    <div style="color: #888; font-size: 0.9em; margin-top: 10px;">
+                        Vehicles grouped by parking orientation
+                    </div>
+                </div>
+            </div>
+            
+            <div class="result-card">
+                <h3>📈 Cluster Breakdown</h3>
+                <div id="clusterList" class="cluster-list"></div>
+            </div>
+        </div>
+        
+        <footer>
+            <div>sPARKing v1.0 :: Powered by SAM3 Computer Vision model</div>
+            <div style="margin-top: 5px;">🚀 Built at LauzHack 2025 🚀</div>
+        </footer>
+    </div>
+    
+    <script>
+        const uploadZone = document.getElementById('uploadZone');
+        const fileInput = document.getElementById('fileInput');
+        const previewContainer = document.getElementById('previewContainer');
+        const previewImage = document.getElementById('previewImage');
+        const analyzeBtn = document.getElementById('analyzeBtn');
+        const loading = document.getElementById('loading');
+        const error = document.getElementById('error');
+        const results = document.getElementById('results');
+        
+        let selectedFile = null;
+        
+        // Upload zone click
+        uploadZone.addEventListener('click', () => fileInput.click());
+        
+        // File selection
+        fileInput.addEventListener('change', (e) => {
+            handleFile(e.target.files[0]);
+        });
+        
+        // Drag and drop
+        uploadZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadZone.classList.add('drag-over');
+        });
+        
+        uploadZone.addEventListener('dragleave', () => {
+            uploadZone.classList.remove('drag-over');
+        });
+        
+        uploadZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadZone.classList.remove('drag-over');
+            handleFile(e.dataTransfer.files[0]);
+        });
+        
+        function handleFile(file) {
+            if (!file || !file.type.startsWith('image/')) {
+                showError('Please select a valid image file');
+                return;
+            }
+            
+            selectedFile = file;
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                previewImage.src = e.target.result;
+                previewContainer.style.display = 'block';
+                results.classList.remove('active');
+            };
+            reader.readAsDataURL(file);
+        }
+        
+        analyzeBtn.addEventListener('click', async () => {
+            if (!selectedFile) return;
+            
+            loading.classList.add('active');
+            error.classList.remove('active');
+            results.classList.remove('active');
+            analyzeBtn.disabled = true;
+            
+            const formData = new FormData();
+            formData.append('image', selectedFile);
+            
+            try {
+                const response = await fetch('/analyze', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    showError(data.error);
+                } else {
+                    displayResults(data);
+                }
+            } catch (err) {
+                showError('Analysis failed: ' + err.message);
+            } finally {
+                loading.classList.remove('active');
+                analyzeBtn.disabled = false;
+            }
+        });
+        
+        function displayResults(data) {
+            document.getElementById('totalCars').textContent = data.total_cars;
+            document.getElementById('numClusters').textContent = data.num_clusters;
+            document.getElementById('detectionImage').src = 'data:image/png;base64,' + data.detection_image;
+            document.getElementById('clusterImage').src = 'data:image/png;base64,' + data.cluster_image;
+            
+            const clusterList = document.getElementById('clusterList');
+            clusterList.innerHTML = data.cluster_details.map(cluster => `
+                <div class="cluster-item">
+                    <div>
+                        <strong style="color: #00d4ff;">Cluster ${cluster.cluster_id + 1}</strong>
+                        <div style="font-size: 0.9em; color: #888; margin-top: 5px;">
+                            Orientation: ${cluster.angle.toFixed(1)}° | Count: ${cluster.count} vehicles
+                        </div>
+                    </div>
+                    <div style="font-size: 1.5em;">🚗</div>
+                </div>
+            `).join('');
+            
+            results.classList.add('active');
+        }
+        
+        function showError(message) {
+            error.textContent = '⚠️ ' + message;
+            error.classList.add('active');
+        }
+    </script>
+</body>
+</html>
